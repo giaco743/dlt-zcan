@@ -110,7 +110,7 @@ fn decode(buf: []const u8) !DltHeaders {
     var variable_offset: usize = STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE;
 
     if (standard_hdr.htype.wsid == 1) {
-        variable_offset += 4; // 4 bytes for ECU ID + 4 bytes for Session ID
+        variable_offset += 4; // 4 bytes for Session ID
     }
     if (standard_hdr.htype.wtms == 1) {
         variable_offset += 4; // 4 bytes for Timestamp
@@ -137,6 +137,7 @@ const DltFilter = struct {
     apid: ?[4]u8,
     ctid: ?[4]u8,
     severity: ?LogSeverity,
+    substring: ?[]const u8,
 };
 
 fn filter(io: std.Io, in: std.Io.File, writer: anytype, fltr: DltFilter) !void {
@@ -168,6 +169,10 @@ fn filter(io: std.Io, in: std.Io.File, writer: anytype, fltr: DltFilter) !void {
             };
 
             const msg_len = STORAGE_HEADER_SIZE + hdr.standard_hdr.length;
+            const payload_offset = if (hdr.standard_hdr.htype.wevt == 1)
+                STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE + EXTENDED_HEADER_SIZE
+            else
+                STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE;
 
             // Sanity check.
             if (msg_len > remaining.len) {
@@ -175,8 +180,9 @@ fn filter(io: std.Io, in: std.Io.File, writer: anytype, fltr: DltFilter) !void {
             }
 
             const message = buf[pos .. pos + msg_len];
+            const payload = buf[pos + payload_offset .. pos + msg_len];
 
-            if (matches(hdr, fltr)) {
+            if (matches(hdr, payload, fltr)) {
                 try writer.writeAll(message);
             }
 
@@ -190,7 +196,7 @@ fn filter(io: std.Io, in: std.Io.File, writer: anytype, fltr: DltFilter) !void {
     try writer.flush();
 }
 
-fn matches(hdr: DltHeaders, fltr: DltFilter) bool {
+fn matches(hdr: DltHeaders, payload: []const u8, fltr: DltFilter) bool {
     if (fltr.ecuid) |ecuid| {
         if (!std.mem.eql(u8, hdr.storage_hdr.ecu_id[0..], ecuid[0..])) {
             return false;
@@ -217,6 +223,11 @@ fn matches(hdr: DltHeaders, fltr: DltFilter) bool {
             return false;
         }
     }
+    if (fltr.substring) |substring| {
+        if (!std.mem.containsAtLeast(u8, payload, 1, substring)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -228,6 +239,7 @@ pub fn main(init: std.process.Init) !void {
     var apid: ?[4]u8 = null;
     var ctid: ?[4]u8 = null;
     var level: ?LogSeverity = null;
+    var substring: ?[]const u8 = null;
 
     var it = init.minimal.args.iterate();
     const name = it.next() orelse {
@@ -270,6 +282,12 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 return error.LogLevelNotSpecified;
             }
+        } else if (std.mem.eql(u8, arg, "--substring")) {
+            if (it.next()) |substr| {
+                substring = substr;
+            } else {
+                return error.SubstringNotSpecified;
+            }
         } else {
             if (in == null) in = arg else if (out == null) out = arg else {
                 std.debug.print(
@@ -301,6 +319,6 @@ pub fn main(init: std.process.Init) !void {
     var writer_impl = out_file.writer(io, &wbuf);
     const writer = &writer_impl.interface;
 
-    const fltr = DltFilter{ .ecuid = ecuid, .apid = apid, .ctid = ctid, .severity = level };
+    const fltr = DltFilter{ .ecuid = ecuid, .apid = apid, .ctid = ctid, .severity = level, .substring = substring };
     try filter(io, in_file, writer, fltr);
 }
