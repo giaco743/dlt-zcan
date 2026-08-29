@@ -18,10 +18,10 @@ comptime {
 
 const HeaderType = packed struct(u8) {
     wevt: u1,
+    msbf: u1,
+    weid: u1,
     wsid: u1,
     wtms: u1,
-    reserved: u1,
-    msbf: u1,
     vers: u3,
 };
 
@@ -126,6 +126,9 @@ fn decode(buf: []const u8) !DltHeaders {
 
     var variable_offset: usize = STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE;
 
+    if (standard_hdr.htype.weid == 1) {
+        variable_offset += 4; // 4 bytes for ECU ID
+    }
     if (standard_hdr.htype.wsid == 1) {
         variable_offset += 4; // 4 bytes for Session ID
     }
