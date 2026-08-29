@@ -140,14 +140,11 @@ const DltFilter = struct {
     substring: ?[]const u8,
 };
 
-fn filter(io: std.Io, in: std.Io.File, writer: anytype, fltr: DltFilter) !void {
+fn filter(reader: anytype, writer: anytype, fltr: DltFilter) !void {
     var buf: [256 * 1024]u8 = undefined;
     var buffered: usize = 0;
     while (true) {
-        const n = in.readStreaming(io, &.{buf[buffered..]}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
+        const n = try reader.readSliceShort(buf[buffered..]);
         if (n == 0) {
             if (buffered != 0)
                 return error.TruncatedMessage;
@@ -315,10 +312,14 @@ pub fn main(init: std.process.Init) !void {
     );
     defer out_file.close(io);
 
+    var rbuf: [256 * 1024]u8 = undefined;
+    var reader_impl = in_file.reader(io, &rbuf);
+    const reader = &reader_impl.interface;
+
     var wbuf: [256 * 1024]u8 = undefined;
     var writer_impl = out_file.writer(io, &wbuf);
     const writer = &writer_impl.interface;
 
     const fltr = DltFilter{ .ecuid = ecuid, .apid = apid, .ctid = ctid, .severity = level, .substring = substring };
-    try filter(io, in_file, writer, fltr);
+    try filter(reader, writer, fltr);
 }
