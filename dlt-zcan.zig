@@ -87,6 +87,23 @@ const ExtendedHeader = extern struct {
     ctid: [4]u8,
 };
 
+const TypeInfo = packed struct(u32) {
+    tyle: u4,
+    bool_: u1,
+    sint: u1,
+    uint: u1,
+    floa: u1,
+    aray: u1,
+    strg: u1,
+    rawd: u1,
+    vari: u1,
+    fixp: u1,
+    trai: u1,
+    stru: u1,
+    scod: u3,
+    reserved: u14,
+};
+
 const DltHeaders = struct {
     storage_hdr: StorageHeader,
     standard_hdr: StandardHeader,
@@ -140,7 +157,7 @@ const DltFilter = struct {
     substring: ?[]const u8,
 };
 
-fn filter(reader: anytype, writer: anytype, fltr: DltFilter) !void {
+fn filter(reader: anytype, writer: anytype, fltr: DltFilter, pretty: bool) !void {
     var buf: [256 * 1024]u8 = undefined;
     var buffered: usize = 0;
     while (true) {
@@ -166,10 +183,13 @@ fn filter(reader: anytype, writer: anytype, fltr: DltFilter) !void {
             };
 
             const msg_len = STORAGE_HEADER_SIZE + hdr.standard_hdr.length;
-            const payload_offset = if (hdr.standard_hdr.htype.wevt == 1)
-                STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE + EXTENDED_HEADER_SIZE
-            else
-                STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE;
+            var payload_offset = STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE;
+            if (hdr.standard_hdr.htype.wsid == 1)
+                payload_offset += 4;
+            if (hdr.standard_hdr.htype.wtms == 1)
+                payload_offset += 4;
+            if (hdr.standard_hdr.htype.wevt == 1)
+                payload_offset += EXTENDED_HEADER_SIZE;
 
             // Sanity check.
             if (msg_len > remaining.len) {
@@ -180,7 +200,11 @@ fn filter(reader: anytype, writer: anytype, fltr: DltFilter) !void {
             const payload = buf[pos + payload_offset .. pos + msg_len];
 
             if (matches(hdr, payload, fltr)) {
-                try writer.writeAll(message);
+                if (pretty) {
+                    try prettyPrint(writer, hdr, payload);
+                } else {
+                    try writer.writeAll(message);
+                }
             }
 
             pos += msg_len;
@@ -228,6 +252,218 @@ fn matches(hdr: DltHeaders, payload: []const u8, fltr: DltFilter) bool {
     return true;
 }
 
+//------------------------------ Start Printing -----------------------------------------
+
+fn typeLength(tyle: u4) !usize {
+    return switch (tyle) {
+        1 => 1, // 8 bit
+        2 => 2, // 16 bit
+        3 => 4, // 32 bit
+        4 => 8, // 64 bit
+        5 => 16, // 128 bit
+        else => error.UnsupportedTypeLength,
+    };
+}
+
+fn printInt(
+    writer: anytype,
+    buf: []const u8,
+    size: usize,
+    signed: bool,
+    endian: std.builtin.Endian,
+) !void {
+    switch (size) {
+        1 => if (signed)
+            try writer.print("{d}", .{std.mem.readInt(i8, buf[0..1], endian)})
+        else
+            try writer.print("{d}", .{std.mem.readInt(u8, buf[0..1], endian)}),
+
+        2 => if (signed)
+            try writer.print("{d}", .{std.mem.readInt(i16, buf[0..2], endian)})
+        else
+            try writer.print("{d}", .{std.mem.readInt(u16, buf[0..2], endian)}),
+
+        4 => if (signed)
+            try writer.print("{d}", .{std.mem.readInt(i32, buf[0..4], endian)})
+        else
+            try writer.print("{d}", .{std.mem.readInt(u32, buf[0..4], endian)}),
+
+        8 => if (signed)
+            try writer.print("{d}", .{std.mem.readInt(i64, buf[0..8], endian)})
+        else
+            try writer.print("{d}", .{std.mem.readInt(u64, buf[0..8], endian)}),
+
+        16 => if (signed)
+            try writer.print("{d}", .{std.mem.readInt(i128, buf[0..16], endian)})
+        else
+            try writer.print("{d}", .{std.mem.readInt(u128, buf[0..16], endian)}),
+
+        else => return error.UnsupportedType,
+    }
+}
+
+fn printFloat(writer: anytype, buf: []const u8, size: usize, endian: std.builtin.Endian) !void {
+    switch (size) {
+        4 => {
+            const bits = std.mem.readInt(u32, buf[0..4], endian);
+            const value: f32 = @bitCast(bits);
+            try writer.print("{d}", .{value});
+        },
+        8 => {
+            const bits = std.mem.readInt(u64, buf[0..8], endian);
+            const value: f64 = @bitCast(bits);
+            try writer.print("{d}", .{value});
+        },
+        else => return error.UnsupportedType,
+    }
+}
+
+fn getArrayElements(buf: []const u8, endian: std.builtin.Endian, arg_pos: *usize) !usize {
+    const dimensions = std.mem.readInt(
+        u16,
+        buf[0..2],
+        endian,
+    );
+    arg_pos.* += 2;
+    var n_elements: usize = 1;
+    for (0..dimensions) |_| {
+        const n_dim = std.mem.readInt(
+            u16,
+            buf[arg_pos.*..][0..2],
+            endian,
+        );
+        arg_pos.* += 2;
+        n_elements *= n_dim;
+    }
+    return n_elements;
+}
+
+fn printArgs(writer: anytype, noar: u8, buf: []const u8, endian: std.builtin.Endian) !void {
+    try writer.print(
+        "[",
+        .{},
+    );
+    var arg_pos: usize = 0;
+    for (0..noar) |i| {
+        const raw_type_info = std.mem.readInt(
+            u32,
+            buf[arg_pos..][0..4],
+            endian,
+        );
+        const type_info: TypeInfo = @bitCast(raw_type_info);
+        arg_pos += 4;
+        if (type_info.strg == 1) {
+            if (buf[arg_pos..].len < 2)
+                return error.TruncatedArgument;
+
+            const length = std.mem.readInt(
+                u16,
+                buf[arg_pos..][0..2],
+                endian,
+            );
+            arg_pos += 2;
+
+            if (buf[arg_pos..].len < length)
+                return error.TruncatedArgument;
+
+            try writer.print(
+                "\"{s}\"",
+                .{buf[arg_pos..][0..length]},
+            );
+            arg_pos += length;
+        } else if (type_info.rawd == 1) {
+            if (buf[arg_pos..].len < 2)
+                return error.TruncatedArgument;
+
+            const length = std.mem.readInt(
+                u16,
+                buf[arg_pos..][0..2],
+                endian,
+            );
+            arg_pos += 2;
+
+            if (buf[arg_pos..].len < length)
+                return error.TruncatedArgument;
+
+            try writer.print(
+                "{x}",
+                .{buf[arg_pos..][0..length]},
+            );
+            arg_pos += length;
+        } else if (type_info.sint == 1 or type_info.uint == 1) {
+            const size = try typeLength(type_info.tyle);
+            if (type_info.aray == 1) {
+                const n_elem = try getArrayElements(buf[arg_pos..], endian, &arg_pos);
+                for (0..n_elem) |_| {
+                    try printInt(writer, buf[arg_pos..], size, type_info.sint == 1, endian);
+                    arg_pos += size;
+                }
+            } else {
+                try printInt(writer, buf[arg_pos..], size, type_info.sint == 1, endian);
+                arg_pos += size;
+            }
+        } else if (type_info.floa == 1) {
+            const size = try typeLength(type_info.tyle);
+            if (type_info.aray == 1) {
+                const n_elem = try getArrayElements(buf[arg_pos..], endian, &arg_pos);
+                for (0..n_elem) |_| {
+                    try printFloat(writer, buf[arg_pos..], size, endian);
+                    arg_pos += size;
+                }
+            } else {
+                try printInt(writer, buf[arg_pos..], try typeLength(type_info.tyle), type_info.sint == 1, endian);
+                arg_pos += size;
+            }
+        } else {
+            return error.NotYetImplemented;
+        }
+        if (i + 1 < noar) {
+            try writer.writeAll(", ");
+        }
+    }
+    try writer.print(
+        "]",
+        .{},
+    );
+}
+
+fn prettyPrint(writer: anytype, hdr: DltHeaders, payload: []const u8) !void {
+    if (hdr.extended_hdr) |ext_hdr| {
+        const level = switch (ext_hdr.msin.mtin) {
+            .fatal => "FATL",
+            .err => " ERR",
+            .warn => "WARN",
+            .info => "INFO",
+            .debug => "DEBG",
+            .verbose => "VERB",
+            _ => "????",
+        };
+        try writer.print(
+            "ECU={s} APID={s} CTID={s} Level={s} | ",
+            .{ hdr.storage_hdr.ecu_id, ext_hdr.apid, ext_hdr.ctid, level },
+        );
+        if (ext_hdr.msin.verbose == 1) {
+            const endian: std.builtin.Endian =
+                if (hdr.standard_hdr.htype.msbf == 1)
+                    .big
+                else
+                    .little;
+            try printArgs(writer, ext_hdr.noar, payload, endian);
+        }
+        try writer.print(
+            "\n",
+            .{},
+        );
+    } else {
+        try writer.print(
+            "ECU={s} | {x}\n",
+            .{ hdr.storage_hdr.ecu_id, payload },
+        );
+    }
+}
+
+//------------------------------ End Printing -----------------------------------------
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var in: ?[:0]const u8 = null;
@@ -237,6 +473,7 @@ pub fn main(init: std.process.Init) !void {
     var ctid: ?[4]u8 = null;
     var level: ?LogSeverity = null;
     var substring: ?[]const u8 = null;
+    var pretty: bool = false;
 
     var it = init.minimal.args.iterate();
     const name = it.next() orelse {
@@ -285,6 +522,8 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 return error.SubstringNotSpecified;
             }
+        } else if (std.mem.eql(u8, arg, "--pretty")) {
+            pretty = true;
         } else {
             if (in == null) in = arg else if (out == null) out = arg else {
                 std.debug.print(
@@ -303,14 +542,17 @@ pub fn main(init: std.process.Init) !void {
     );
     defer in_file.close(io);
 
-    const out_file = try std.Io.Dir.cwd().createFile(
-        io,
-        out orelse return error.MissingOutputFile,
-        .{
-            .truncate = true,
-        },
-    );
-    defer out_file.close(io);
+    const out_file = if (out) |outfile|
+        try std.Io.Dir.cwd().createFile(
+            io,
+            outfile,
+            .{
+                .truncate = true,
+            },
+        )
+    else
+        std.Io.File.stdout();
+    defer if (out != null) out_file.close(io);
 
     var rbuf: [256 * 1024]u8 = undefined;
     var reader_impl = in_file.reader(io, &rbuf);
@@ -321,5 +563,5 @@ pub fn main(init: std.process.Init) !void {
     const writer = &writer_impl.interface;
 
     const fltr = DltFilter{ .ecuid = ecuid, .apid = apid, .ctid = ctid, .severity = level, .substring = substring };
-    try filter(reader, writer, fltr);
+    try filter(reader, writer, fltr, pretty);
 }
