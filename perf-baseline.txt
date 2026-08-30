@@ -1,0 +1,5 @@
+Baseline:
+cat             4.606 s
+filter2         6.999 s
+filter2+ECU     7.040 s
+filter2+search  8.910 s

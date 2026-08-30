@@ -255,6 +255,100 @@ fn matches(hdr: DltHeaders, payload: []const u8, fltr: DltFilter) bool {
     return true;
 }
 
+//------------------------------ No copy filtering ------------------------------------
+fn checkPattern(storage_hdr: []const u8) bool {
+    return std.mem.eql(u8, storage_hdr[0..4], DLT_PATTERN[0..]);
+}
+fn getLength(standard_hdr: []const u8) u16 {
+    return std.mem.readInt(u16, standard_hdr[2..4], .big);
+}
+fn getHeaderType(standard_hdr: []const u8) HeaderType {
+    return @bitCast(standard_hdr[0]);
+}
+fn getEcuIdFromStorageHdr(storage_hdr: []const u8) []const u8 {
+    return storage_hdr[12..];
+}
+fn getAppIdFromExtHdr(ext_hdr: []const u8) []const u8 {
+    return ext_hdr[2..6];
+}
+fn getCtxIdFromExtHdr(ext_hdr: []const u8) []const u8 {
+    return ext_hdr[6..10];
+}
+fn getMessageInfoFromExtHdr(ext_hdr: []const u8) MessageInfo {
+    return @bitCast(ext_hdr[0]);
+}
+fn filter2(reader: anytype, writer: anytype, fltr: DltFilter) !void {
+    var buf: [256 * 1024]u8 = undefined;
+    var buffered: usize = 0;
+    const need_extra_hdr = fltr.apid != null or fltr.ctid != null or fltr.severity != null;
+
+    while (true) {
+        const n = try reader.readSliceShort(buf[buffered..]);
+        if (n == 0) {
+            if (buffered != 0)
+                return error.TruncatedMessage;
+            break;
+        }
+
+        const len = buffered + n;
+        var pos: usize = 0;
+
+        while (pos < len) {
+            const remaining = buf[pos..len];
+            if (remaining.len < STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE) {
+                break;
+            }
+            const storage_hdr = remaining[0..STORAGE_HEADER_SIZE];
+            const standard_hdr = remaining[STORAGE_HEADER_SIZE..][0..STANDARD_HEADER_SIZE];
+
+            const msg_len = getLength(standard_hdr) + STORAGE_HEADER_SIZE;
+            if (pos + msg_len > len) break;
+
+            pos += msg_len;
+
+            const hdr_type = getHeaderType(standard_hdr);
+            var payload_offset = STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE;
+            if (hdr_type.weid == 1) payload_offset += 4;
+            if (hdr_type.wsid == 1) payload_offset += 4;
+            if (hdr_type.wtms == 1) payload_offset += 4;
+            const ext_hdr_offset = payload_offset;
+            if (hdr_type.wevt == 1) payload_offset += EXTENDED_HEADER_SIZE;
+
+            if (fltr.ecuid) |ecuid| {
+                if (!std.mem.eql(u8, ecuid[0..], getEcuIdFromStorageHdr(storage_hdr))) continue;
+            }
+
+            if (need_extra_hdr) {
+                // We need the extended header to retrieve this information
+                if (hdr_type.wevt == 0) continue;
+                const ext_hdr = remaining[ext_hdr_offset..][0..EXTENDED_HEADER_SIZE];
+
+                if (fltr.apid) |appid| {
+                    if (!std.mem.eql(u8, appid[0..], getAppIdFromExtHdr(ext_hdr))) continue;
+                }
+
+                if (fltr.ctid) |ctxid| {
+                    if (!std.mem.eql(u8, ctxid[0..], getCtxIdFromExtHdr(ext_hdr))) continue;
+                }
+
+                if (fltr.severity) |log_level| {
+                    if (@intFromEnum(log_level) <= @intFromEnum(getMessageInfoFromExtHdr(ext_hdr).mtin)) continue;
+                }
+            }
+            if (fltr.substring) |substring| {
+                if (!std.mem.containsAtLeast(u8, remaining[payload_offset..msg_len], 1, substring)) continue;
+            }
+            try writer.writeAll(remaining[0..msg_len]);
+        }
+
+        // Move incomplete tail to beginning of buffer.
+        buffered = len - pos;
+        std.mem.copyForwards(u8, buf[0..buffered], buf[pos..len]);
+    }
+    try writer.flush();
+}
+//------------------------------ No copy filtering ------------------------------------
+
 //------------------------------ Start Printing -----------------------------------------
 
 fn typeLength(tyle: u4) !usize {
@@ -579,5 +673,5 @@ pub fn main(init: std.process.Init) !void {
     const writer = &writer_impl.interface;
 
     const fltr = DltFilter{ .ecuid = ecuid, .apid = apid, .ctid = ctid, .severity = level, .substring = substring };
-    try filter(reader, writer, fltr, pretty);
+    try filter2(reader, writer, fltr);
 }
