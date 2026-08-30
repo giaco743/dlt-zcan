@@ -414,8 +414,21 @@ fn printArgs(writer: anytype, noar: u8, buf: []const u8, endian: std.builtin.End
                     arg_pos += size;
                 }
             } else {
-                try printInt(writer, buf[arg_pos..], try typeLength(type_info.tyle), type_info.sint == 1, endian);
+                try printFloat(writer, buf[arg_pos..], try typeLength(type_info.tyle), endian);
                 arg_pos += size;
+            }
+        } else if (type_info.bool_ == 1) {
+            if (type_info.aray == 1) {
+                const n_elem = try getArrayElements(buf[arg_pos..], endian, &arg_pos);
+                for (0..n_elem) |_| {
+                    const value = buf[arg_pos] != 0;
+                    try writer.print("{}", .{value});
+                    arg_pos += 1;
+                }
+            } else {
+                const value = buf[arg_pos] != 0;
+                try writer.print("{}", .{value});
+                arg_pos += 1;
             }
         } else {
             return error.NotYetImplemented;
