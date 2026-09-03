@@ -1,8 +1,24 @@
 const std = @import("std");
 
-const DLT_PATTERN = "DLT\x01";
-
 const STORAGE_HEADER_SIZE: u16 = 16;
+const STANDARD_HEADER_SIZE: u16 = 4;
+const EXTENDED_HEADER_SIZE: u16 = 10;
+
+const PATTERN: []const u8 = "DLT\x01";
+
+const StorageHeader = struct {
+    ts_s: u32,
+    ts_us: u32,
+    ecuid: []const u8,
+
+    fn init(buf: []const u8) !StorageHeader {
+        if (!std.mem.eql(u8, buf[0..4], PATTERN)) return error.PatternMissing;
+        const ts_s = std.mem.readInt(u32, buf[4..8], .little);
+        const ts_us = std.mem.readInt(u32, buf[8..12], .little);
+        const ecuid = buf[12..16];
+        return StorageHeader{ .ts_s = ts_s, .ts_us = ts_us, .ecuid = ecuid };
+    }
+};
 
 const HeaderType = packed struct(u8) {
     wevt: u1,
@@ -12,8 +28,6 @@ const HeaderType = packed struct(u8) {
     wtms: u1,
     vers: u3,
 };
-
-const STANDARD_HEADER_SIZE: u16 = 4;
 
 const MessageType = enum(u3) {
     log = 0x0,
@@ -38,8 +52,6 @@ const MessageInfo = packed struct(u8) {
     mstp: MessageType,
     mtin: LogSeverity,
 };
-
-const EXTENDED_HEADER_SIZE: u16 = 10;
 
 const TypeInfo = packed struct(u32) {
     tyle: u4,
@@ -66,144 +78,110 @@ const DltFilter = struct {
     substring: ?[]const u8,
 };
 
-const DltMessageView = struct {
-    storage_hdr: []const u8,
-    standard_hdr: []const u8,
+const DltStandardHeader = struct {
     hdr_type: HeaderType,
-    payload: []const u8,
-    ecu_id: ?[]const u8,
-    session_id: ?[]const u8,
-    timestamp: ?[]const u8,
-    ext_hdr: ?[]const u8,
-    len: u16,
+    payload_len: u16,
 
-    fn init(buf: []const u8) !DltMessageView {
-        if (buf.len < STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE) return error.Truncated;
-        if (!std.mem.eql(u8, buf[0..4], DLT_PATTERN[0..])) return error.WrongPattern;
-
-        const storage_hdr = buf[0..STORAGE_HEADER_SIZE];
-        const standard_hdr = buf[STORAGE_HEADER_SIZE..][0..STANDARD_HEADER_SIZE];
-
-        const len = std.mem.readInt(u16, standard_hdr[2..4], .big) + STORAGE_HEADER_SIZE;
-        if (buf.len < len) return error.Truncated;
-
-        var ecu_id: ?[]const u8 = null;
-        var session_id: ?[]const u8 = null;
-        var timestamp: ?[]const u8 = null;
-        var ext_hdr: ?[]const u8 = null;
-
-        const hdr_type: HeaderType = @bitCast(standard_hdr[0]);
-        var payload_offset = STORAGE_HEADER_SIZE + STANDARD_HEADER_SIZE;
-        if (hdr_type.weid == 1) {
-            ecu_id = buf[payload_offset..][0..4];
-            payload_offset += 4;
-        }
-        if (hdr_type.wsid == 1) {
-            session_id = buf[payload_offset..][0..4];
-            payload_offset += 4;
-        }
-        if (hdr_type.wtms == 1) {
-            timestamp = buf[payload_offset..][0..4];
-            payload_offset += 4;
-        }
-        if (hdr_type.wevt == 1) {
-            ext_hdr = buf[payload_offset..][0..EXTENDED_HEADER_SIZE];
-            payload_offset += EXTENDED_HEADER_SIZE;
-        }
-        const payload = buf[payload_offset..len];
-        return DltMessageView{
-            .storage_hdr = storage_hdr,
-            .standard_hdr = standard_hdr,
+    fn init(buf: []const u8) DltStandardHeader {
+        const hdr_type: HeaderType = @bitCast(buf[0]);
+        const len = std.mem.readInt(u16, buf[2..4], .big);
+        return DltStandardHeader{
             .hdr_type = hdr_type,
-            .payload = payload,
-            .ecu_id = ecu_id,
-            .session_id = session_id,
-            .timestamp = timestamp,
-            .ext_hdr = ext_hdr,
-            .len = len,
+            .payload_len = len - 4,
         };
-    }
-    fn ecuId(self: *const DltMessageView) []const u8 {
-        if (self.ecu_id) |ecu_id| return ecu_id;
-        // Fall back to storage header ECU ID
-        return self.storage_hdr[12..];
-    }
-    fn appId(self: *const DltMessageView) ?[]const u8 {
-        if (self.ext_hdr) |ext_hdr|
-            return ext_hdr[2..6];
-        return null;
-    }
-    fn ctxId(self: *const DltMessageView) ?[]const u8 {
-        if (self.ext_hdr) |ext_hdr|
-            return ext_hdr[6..10];
-        return null;
-    }
-    fn messageInfo(self: *const DltMessageView) ?MessageInfo {
-        if (self.ext_hdr) |ext_hdr|
-            return @bitCast(ext_hdr[0]);
-        return null;
-    }
-    fn noar(self: *const DltMessageView) ?u8 {
-        if (self.ext_hdr) |ext_hdr|
-            return @bitCast(ext_hdr[1]);
-        return null;
     }
 };
 
-fn filter(reader: anytype, writer: anytype, fltr: DltFilter, pretty: bool) !void {
-    var buf: [256 * 1024]u8 = undefined;
-    var buffered: usize = 0;
+const DltExtHeader = struct {
+    buf: []const u8,
 
-    while (true) {
-        const n = try reader.readSliceShort(buf[buffered..]);
-        if (n == 0) {
-            if (buffered != 0)
-                return error.TruncatedMessage;
-            break;
-        }
-
-        const len = buffered + n;
-        var pos: usize = 0;
-
-        while (pos < len) {
-            const remaining = buf[pos..len];
-            const msg_view = DltMessageView.init(remaining) catch |err| switch (err) {
-                error.Truncated => break,
-                else => return err,
-            };
-            pos += msg_view.len;
-
-            if (fltr.ecuid) |ecuid| {
-                if (!std.mem.eql(u8, ecuid[0..], msg_view.ecuId())) continue;
-            }
-
-            if (fltr.apid) |appid| {
-                if (!std.mem.eql(u8, appid[0..], msg_view.appId() orelse continue)) continue;
-            }
-
-            if (fltr.ctid) |ctxid| {
-                if (!std.mem.eql(u8, ctxid[0..], msg_view.ctxId() orelse continue)) continue;
-            }
-
-            if (fltr.severity) |log_level| {
-                const message_info = msg_view.messageInfo() orelse continue;
-                if (@intFromEnum(log_level) <= @intFromEnum(message_info.mtin)) continue;
-            }
-            if (fltr.substring) |substring| {
-                if (!std.mem.containsAtLeast(u8, msg_view.payload, 1, substring)) continue;
-            }
-            if (pretty) {
-                try prettyPrint(writer, msg_view);
-            } else {
-                try writer.writeAll(remaining[0..msg_view.len]);
-            }
-        }
-
-        // Move incomplete tail to beginning of buffer.
-        buffered = len - pos;
-        std.mem.copyForwards(u8, buf[0..buffered], buf[pos..len]);
+    fn messageInfo(self: *const DltExtHeader) MessageInfo {
+        return @bitCast(self.buf[0]);
     }
-    try writer.flush();
+    fn noar(self: *const DltExtHeader) u8 {
+        return @bitCast(self.buf[1]);
+    }
+    fn appId(self: *const DltExtHeader) []const u8 {
+        return self.buf[2..6];
+    }
+    fn ctxId(self: *const DltExtHeader) []const u8 {
+        return self.buf[6..10];
+    }
+};
+
+fn filterMessage(reader: anytype, writer: anytype, fltr: DltFilter, need_ext_hdr: bool, storage: bool) !bool {
+    const strg_eid = if (storage) blk: {
+        var storage_hdr_buf: [STORAGE_HEADER_SIZE]u8 = undefined;
+        try reader.readSliceAll(&storage_hdr_buf);
+        const str_hdr = try StorageHeader.init(&storage_hdr_buf);
+        break :blk str_hdr.ecuid;
+    } else null;
+
+    var std_hdr_buf: [STANDARD_HEADER_SIZE]u8 = undefined;
+    try reader.readSliceAll(&std_hdr_buf);
+
+    const std_hdr = DltStandardHeader.init(std_hdr_buf[0..]);
+
+    // The length field of the DLT message allows 0xFFFF = 65,535 bytes
+    var buffer: [64 * 1024]u8 = undefined;
+    if (std_hdr.payload_len > buffer.len) return error.MaxMessageSizeExceeded;
+
+    var payload = buffer[0..std_hdr.payload_len];
+    try reader.readSliceAll(payload);
+
+    const ecuid: ?[]const u8 =
+        if (std_hdr.hdr_type.weid == 1) blk: {
+            const ecuid = payload[0..4];
+            payload = payload[4..];
+            break :blk ecuid;
+        } else strg_eid;
+
+    if (std_hdr.hdr_type.wsid == 1) payload = payload[4..];
+
+    if (std_hdr.hdr_type.wtms == 1) payload = payload[4..];
+
+    const ext_hdr: ?DltExtHeader = if (std_hdr.hdr_type.wevt == 1) blk: {
+        const ehdr_buf = payload[0..EXTENDED_HEADER_SIZE];
+        payload = payload[EXTENDED_HEADER_SIZE..];
+        break :blk DltExtHeader{ .buf = ehdr_buf };
+    } else null;
+
+    if (fltr.ecuid) |eid| {
+        if (!std.mem.eql(u8, eid[0..], ecuid orelse return false)) return false;
+    }
+    if (fltr.substring) |substring| {
+        if (!std.mem.containsAtLeast(u8, payload, 1, substring)) return false;
+    }
+
+    if (need_ext_hdr) {
+        const ehdr = ext_hdr orelse return false;
+
+        if (fltr.apid) |appid| {
+            if (!std.mem.eql(u8, appid[0..], ehdr.appId())) return false;
+        }
+
+        if (fltr.ctid) |ctxid| {
+            if (!std.mem.eql(u8, ctxid[0..], ehdr.ctxId())) return false;
+        }
+
+        if (fltr.severity) |log_level| {
+            if (@intFromEnum(log_level) <= @intFromEnum(ehdr.messageInfo().mtin)) return false;
+        }
+    }
+
+    try prettyPrint(ecuid, ext_hdr, payload, writer, if (std_hdr.hdr_type.msbf == 1) .big else .little);
+    return true;
+}
+
+fn filterStream(reader: anytype, writer: anytype, fltr: DltFilter, storage: bool) !void {
+    const need_ext_hdr = fltr.apid != null or fltr.ctid != null or fltr.severity != null;
+    while (true) {
+        const written = filterMessage(reader, writer, fltr, need_ext_hdr, storage) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (written) try writer.flush();
+    }
 }
 
 //------------------------------ Start Pretty Printing -----------------------------------------
@@ -394,61 +372,77 @@ fn printArgs(writer: anytype, noar: u8, buf: []const u8, endian: std.builtin.End
     );
 }
 
-fn prettyPrint(writer: anytype, msg: DltMessageView) !void {
-    if (msg.ext_hdr != null) {
-        const msg_info = msg.messageInfo().?;
-        const level = switch (msg_info.mtin) {
+fn prettyPrint(
+    ecuid: ?[]const u8,
+    ext_hdr: ?DltExtHeader,
+    payload: []const u8,
+    writer: anytype,
+    endian: std.builtin.Endian,
+) !void {
+    if (ecuid) |eid| try writer.print(
+        "ECU={s} ",
+        .{eid},
+    );
+    if (ext_hdr) |ehdr| {
+        const level = switch (ehdr.messageInfo().mtin) {
             .fatal => "FATL",
             .err => " ERR",
             .warn => "WARN",
             .info => "INFO",
             .debug => "DEBG",
             .verbose => "VERB",
-            _ => "????",
+            _ => "???",
         };
         try writer.print(
-            "ECU={s} APID={s} CTID={s} Level={s} | ",
-            .{ msg.ecuId(), msg.appId().?, msg.ctxId().?, level },
+            "APID={s} CTID={s} Level={s} | ",
+            .{ ehdr.appId(), ehdr.ctxId(), level },
         );
-        if (msg_info.verbose == 1) {
-            const endian: std.builtin.Endian =
-                if (msg.hdr_type.msbf == 1)
-                    .big
-                else
-                    .little;
-            try printArgs(writer, msg.noar().?, msg.payload, endian);
-        }
-        try writer.print("\n", .{});
-    } else {
-        try writer.print("ECU={s} | {x}\n", .{ msg.ecuId(), msg.payload });
-    }
+        if (ehdr.messageInfo().verbose == 1)
+            try printArgs(writer, ehdr.noar(), payload, endian)
+        else
+            try writer.print("{x}", .{payload});
+    } else try writer.print("| {x}", .{payload});
+
+    try writer.print("\n", .{});
 }
 
 //------------------------------ End Pretty Printing -----------------------------------------
+const Options = struct {
+    input: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+    connect: ?[]const u8 = null,
+
+    ecuid: ?[4]u8 = null,
+    apid: ?[4]u8 = null,
+    ctid: ?[4]u8 = null,
+    level: ?LogSeverity = null,
+    substring: ?[]const u8 = null,
+
+    storage: bool = false,
+};
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    var in: ?[:0]const u8 = null;
-    var out: ?[:0]const u8 = null;
-    var ecuid: ?[4]u8 = null;
-    var apid: ?[4]u8 = null;
-    var ctid: ?[4]u8 = null;
-    var level: ?LogSeverity = null;
-    var substring: ?[]const u8 = null;
-    var pretty: bool = false;
 
     var it = init.minimal.args.iterate();
     const name = it.next() orelse {
         return error.MissingProgramName;
     };
+    var options = Options{};
     while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--ecuid")) {
+        if (std.mem.eql(u8, arg, "--connect")) {
+            if (it.next()) |host| {
+                options.connect = host;
+            } else {
+                return error.EcuIdNotSpecified;
+            }
+        } else if (std.mem.eql(u8, arg, "--ecuid")) {
             if (it.next()) |id| {
                 if (id.len > 4)
                     return error.InvalidEcuId;
                 var eid: [4]u8 = [_]u8{0} ** 4;
                 @memcpy(eid[0..id.len], id);
-                ecuid = eid;
+                options.ecuid = eid;
             } else {
                 return error.EcuIdNotSpecified;
             }
@@ -458,7 +452,7 @@ pub fn main(init: std.process.Init) !void {
                     return error.InvalidAppId;
                 var aid: [4]u8 = [_]u8{0} ** 4;
                 @memcpy(aid[0..id.len], id);
-                apid = aid;
+                options.apid = aid;
             } else {
                 return error.AppIdNotSpecified;
             }
@@ -468,62 +462,57 @@ pub fn main(init: std.process.Init) !void {
                     return error.InvalidContextId;
                 var cid: [4]u8 = [_]u8{0} ** 4;
                 @memcpy(cid[0..id.len], id);
-                ctid = cid;
+                options.ctid = cid;
             } else {
                 return error.ContextIdNotSpecified;
             }
         } else if (std.mem.eql(u8, arg, "--level")) {
             if (it.next()) |l_str| {
-                level = @enumFromInt(try std.fmt.parseInt(u4, l_str, 10));
+                options.level = @enumFromInt(try std.fmt.parseInt(u4, l_str, 10));
             } else {
                 return error.LogLevelNotSpecified;
             }
         } else if (std.mem.eql(u8, arg, "--substring")) {
             if (it.next()) |substr| {
-                substring = substr;
+                options.substring = substr;
             } else {
                 return error.SubstringNotSpecified;
             }
-        } else if (std.mem.eql(u8, arg, "--pretty")) {
-            pretty = true;
+        } else if (std.mem.eql(u8, arg, "--storage")) {
+            options.storage = true;
         } else {
-            if (in == null) in = arg else if (out == null) out = arg else {
-                std.debug.print(
-                    "Usage: {s} <in> <out> [--ecuid ECUID] [--apid APID] [--ctid CTID] [--level LEVEL]\n",
-                    .{name},
-                );
-                return error.WrongUsage;
-            }
+            std.debug.print(
+                "Usage: {s} [--connect host] [--ecuid ECUID] [--apid APID] [--ctid CTID] [--substring STRING] [--level LEVEL]\n",
+                .{name},
+            );
+            return error.WrongUsage;
         }
     }
 
-    const in_file = try std.Io.Dir.cwd().openFile(
-        io,
-        in orelse return error.MissingInputFile,
-        .{},
-    );
-    defer in_file.close(io);
+    const host = options.connect orelse return error.MissingHost;
 
-    const out_file = if (out) |outfile|
-        try std.Io.Dir.cwd().createFile(
-            io,
-            outfile,
-            .{
-                .truncate = true,
-            },
-        )
-    else
-        std.Io.File.stdout();
-    defer if (out != null) out_file.close(io);
+    var it_host = std.mem.splitScalar(u8, host, ':');
+    const hostname = it_host.next() orelse return error.MissingHostname;
+    const port_str = it_host.next() orelse return error.MissingPort;
+    const port = try std.fmt.parseInt(u16, port_str, 10);
+    const hn = try std.Io.net.HostName.init(hostname);
+    const stream = try hn.connect(io, port, .{ .mode = .stream });
+    defer stream.close(io);
 
-    var rbuf: [256 * 1024]u8 = undefined;
-    var reader_impl = in_file.reader(io, &rbuf);
+    var rbuf: [256]u8 = undefined;
+    var reader_impl = stream.reader(io, &rbuf);
     const reader = &reader_impl.interface;
 
-    var wbuf: [256 * 1024]u8 = undefined;
-    var writer_impl = out_file.writer(io, &wbuf);
+    var wbuf: [1 * 1024]u8 = undefined;
+    var writer_impl = std.Io.File.stdout().writer(io, &wbuf);
     const writer = &writer_impl.interface;
 
-    const fltr = DltFilter{ .ecuid = ecuid, .apid = apid, .ctid = ctid, .severity = level, .substring = substring };
-    try filter(reader, writer, fltr, pretty);
+    const fltr = DltFilter{
+        .ecuid = options.ecuid,
+        .apid = options.apid,
+        .ctid = options.ctid,
+        .severity = options.level,
+        .substring = options.substring,
+    };
+    try filterStream(reader, writer, fltr, options.storage);
 }
