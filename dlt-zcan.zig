@@ -87,7 +87,7 @@ const DltStandardHeader = struct {
         const len = std.mem.readInt(u16, buf[2..4], .big);
         return DltStandardHeader{
             .hdr_type = hdr_type,
-            .payload_len = len - 4,
+            .payload_len = len - STANDARD_HEADER_SIZE,
         };
     }
 };
@@ -109,35 +109,24 @@ const DltExtHeader = struct {
     }
 };
 
-fn filterMessage(reader: anytype, writer: anytype, fltr: DltFilter, need_ext_hdr: bool, storage: bool) !bool {
-    const strg_eid = if (storage) blk: {
-        var storage_hdr_buf: [STORAGE_HEADER_SIZE]u8 = undefined;
-        try reader.readSliceAll(&storage_hdr_buf);
-        const str_hdr = try StorageHeader.init(&storage_hdr_buf);
-        break :blk str_hdr.ecuid;
-    } else null;
-
-    var std_hdr_buf: [STANDARD_HEADER_SIZE]u8 = undefined;
-    try reader.readSliceAll(&std_hdr_buf);
-
-    const std_hdr = DltStandardHeader.init(std_hdr_buf[0..]);
-
-    // The length field of the DLT message allows 0xFFFF = 65,535 bytes
-    var buffer: [64 * 1024]u8 = undefined;
-    if (std_hdr.payload_len > buffer.len) return error.MaxMessageSizeExceeded;
-
-    var payload = buffer[0..std_hdr.payload_len];
-    try reader.readSliceAll(payload);
-
+fn filterMessage(
+    ecu_id: ?[]const u8,
+    std_hdr: DltStandardHeader,
+    buffer: []const u8,
+    writer: anytype,
+    fltr: DltFilter,
+    need_ext_hdr: bool,
+) !bool {
+    var payload = buffer;
     const ecuid: ?[]const u8 =
         if (std_hdr.hdr_type.weid == 1) blk: {
             const ecuid = payload[0..4];
             payload = payload[4..];
             break :blk ecuid;
-        } else strg_eid;
+        } else ecu_id;
 
+    // SKip session ID and timestamp for now
     if (std_hdr.hdr_type.wsid == 1) payload = payload[4..];
-
     if (std_hdr.hdr_type.wtms == 1) payload = payload[4..];
 
     const ext_hdr: ?DltExtHeader = if (std_hdr.hdr_type.wevt == 1) blk: {
@@ -173,15 +162,71 @@ fn filterMessage(reader: anytype, writer: anytype, fltr: DltFilter, need_ext_hdr
     return true;
 }
 
-fn filterStream(reader: anytype, writer: anytype, fltr: DltFilter, storage: bool) !void {
+fn filterStream(
+    reader: anytype,
+    writer: anytype,
+    fltr: DltFilter,
+    storage: bool,
+) !void {
     const need_ext_hdr = fltr.apid != null or fltr.ctid != null or fltr.severity != null;
+    // The length field of the DLT message allows 0xFFFF = 65,535 bytes
+    var buffer: [64 * 1024]u8 = undefined;
+    var strg_hdr_buf: [16]u8 = undefined;
+    var std_hdr_buf: [4]u8 = undefined;
     while (true) {
-        const written = filterMessage(reader, writer, fltr, need_ext_hdr, storage) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
+        const strg_eid = if (storage) blk: {
+            try reader.readSliceAll(&strg_hdr_buf);
+            break :blk (try StorageHeader.init(&strg_hdr_buf)).ecuid;
+        } else null;
+        try reader.readSliceAll(&std_hdr_buf);
+        const std_hdr = DltStandardHeader.init(&std_hdr_buf);
+        const payload = buffer[0..std_hdr.payload_len];
+        try reader.readSliceAll(payload);
+
+        if (std_hdr.payload_len > buffer.len) return error.MaxMessageSizeExceeded;
+        const written = try filterMessage(strg_eid, std_hdr, payload, writer, fltr, need_ext_hdr);
         if (written) try writer.flush();
     }
+}
+
+fn filterFile(file: *std.Io.File, io: std.Io, writer: anytype, fltr: DltFilter, storage: bool) !void {
+    const need_ext_hdr = fltr.apid != null or fltr.ctid != null or fltr.severity != null;
+    // The length field of the DLT message allows 0xFFFF = 65,535 bytes
+    var buffer: [254 * 1024]u8 = undefined;
+    var bytes_buffered: usize = 0;
+    const std_hdr_offset = if (storage) STORAGE_HEADER_SIZE else 0;
+    const hdr_size = STANDARD_HEADER_SIZE + std_hdr_offset;
+    var cursor: usize = 0;
+    while (true) {
+        const bytes_read = try file.readPositionalAll(io, buffer[bytes_buffered..], cursor);
+        if (bytes_read == 0) break;
+        cursor += bytes_read;
+        if (bytes_read == 0) continue;
+
+        const buffer_length = bytes_buffered + bytes_read;
+        if (buffer_length < hdr_size) {
+            bytes_buffered = buffer_length;
+            continue;
+        }
+        var pos: usize = 0;
+        while ((buffer_length - pos) >= hdr_size) {
+            const strg_eid = if (storage) (try StorageHeader.init(buffer[pos..][0..STORAGE_HEADER_SIZE])).ecuid else null;
+
+            const std_hdr = DltStandardHeader.init(buffer[pos + std_hdr_offset ..][0..STANDARD_HEADER_SIZE]);
+
+            if (std_hdr.payload_len + hdr_size > buffer_length - pos) break;
+            pos += hdr_size;
+
+            const payload = buffer[pos..][0..std_hdr.payload_len];
+            pos += std_hdr.payload_len;
+
+            _ = try filterMessage(strg_eid, std_hdr, payload, writer, fltr, need_ext_hdr);
+        }
+
+        bytes_buffered = buffer_length - pos;
+        @memcpy(buffer[0..bytes_buffered], buffer[pos..][0..bytes_buffered]);
+    }
+    try writer.flush();
 }
 
 //------------------------------ Start Pretty Printing -----------------------------------------
@@ -436,6 +481,18 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 return error.EcuIdNotSpecified;
             }
+        } else if (std.mem.eql(u8, arg, "--infile")) {
+            if (it.next()) |infile| {
+                options.input = infile;
+            } else {
+                return error.InputFileNotSpecified;
+            }
+        } else if (std.mem.eql(u8, arg, "--outfile")) {
+            if (it.next()) |outfile| {
+                options.output = outfile;
+            } else {
+                return error.InputFileNotSpecified;
+            }
         } else if (std.mem.eql(u8, arg, "--ecuid")) {
             if (it.next()) |id| {
                 if (id.len > 4)
@@ -448,8 +505,6 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--apid")) {
             if (it.next()) |id| {
-                if (id.len != 4)
-                    return error.InvalidAppId;
                 var aid: [4]u8 = [_]u8{0} ** 4;
                 @memcpy(aid[0..id.len], id);
                 options.apid = aid;
@@ -458,8 +513,6 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--ctid")) {
             if (it.next()) |id| {
-                if (id.len != 4)
-                    return error.InvalidContextId;
                 var cid: [4]u8 = [_]u8{0} ** 4;
                 @memcpy(cid[0..id.len], id);
                 options.ctid = cid;
@@ -481,30 +534,24 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--storage")) {
             options.storage = true;
         } else {
-            std.debug.print(
-                "Usage: {s} [--connect host] [--ecuid ECUID] [--apid APID] [--ctid CTID] [--substring STRING] [--level LEVEL]\n",
-                .{name},
-            );
-            return error.WrongUsage;
+            if (options.output == null) {
+                options.output = arg;
+            } else {
+                std.debug.print(
+                    "Usage: {s} [--connect host] [--ecuid ECUID] [--apid APID] [--ctid CTID] [--substring STRING] [--level LEVEL]\n",
+                    .{name},
+                );
+                return error.WrongUsage;
+            }
         }
     }
 
-    const host = options.connect orelse return error.MissingHost;
-
-    var it_host = std.mem.splitScalar(u8, host, ':');
-    const hostname = it_host.next() orelse return error.MissingHostname;
-    const port_str = it_host.next() orelse return error.MissingPort;
-    const port = try std.fmt.parseInt(u16, port_str, 10);
-    const hn = try std.Io.net.HostName.init(hostname);
-    const stream = try hn.connect(io, port, .{ .mode = .stream });
-    defer stream.close(io);
-
-    var rbuf: [256]u8 = undefined;
-    var reader_impl = stream.reader(io, &rbuf);
-    const reader = &reader_impl.interface;
-
-    var wbuf: [1 * 1024]u8 = undefined;
-    var writer_impl = std.Io.File.stdout().writer(io, &wbuf);
+    var wbuf: [256 * 1024]u8 = undefined;
+    var out = if (options.output) |output| try std.Io.Dir.cwd().createFile(io, output, .{
+        .exclusive = false,
+        .truncate = true,
+    }) else std.Io.File.stdout();
+    var writer_impl = out.writer(io, &wbuf);
     const writer = &writer_impl.interface;
 
     const fltr = DltFilter{
@@ -514,5 +561,22 @@ pub fn main(init: std.process.Init) !void {
         .severity = options.level,
         .substring = options.substring,
     };
-    try filterStream(reader, writer, fltr, options.storage);
+    if (options.connect) |host| {
+        var it_host = std.mem.splitScalar(u8, host, ':');
+        const hostname = it_host.next() orelse return error.MissingHostname;
+        const port_str = it_host.next() orelse return error.MissingPort;
+        const port = try std.fmt.parseInt(u16, port_str, 10);
+        const hn = try std.Io.net.HostName.init(hostname);
+        const stream = try hn.connect(io, port, .{ .mode = .stream });
+        defer stream.close(io);
+
+        var rbuf: [256 * 1024]u8 = undefined;
+        var reader_impl = stream.reader(io, &rbuf);
+        const reader = &reader_impl.interface;
+        try filterStream(reader, writer, fltr, options.storage);
+    } else if (options.input) |path| {
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        try filterFile(&file, io, writer, fltr, options.storage);
+    } else return error.MissingInput;
 }
