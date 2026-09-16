@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--level")) {
             if (it.next()) |l_str| {
-                options.level = @fromBackingInt(@intCast(try std.fmt.parseInt(u4, l_str, 10)));
+                options.level = @enumFromInt(@as(u3, @intCast(try std.fmt.parseInt(u3, l_str, 10))));
             } else {
                 return error.LogLevelNotSpecified;
             }
