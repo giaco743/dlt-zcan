@@ -1,0 +1,13 @@
+.{
+    .name = .dlt_zcan,
+    .version = "0.0.1",
+    .dependencies = .{
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#f37c42a3b324131c131d066767968e1f5b976453",
+            .hash = "vaxis-0.6.0-BWNV_AIQDADLTDo5jCn27pBWJBvi-sTrSkSKwITQWgUV",
+        },
+    },
+    .minimum_zig_version = "0.17.0-dev.2131+d08989840",
+    .paths = .{""},
+    .fingerprint = 0xcf9a634c06d1436d,
+}

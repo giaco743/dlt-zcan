@@ -82,7 +82,7 @@ pub const DltStandardHeader = struct {
         const hdr_type: HeaderType = @bitCast(buf[0]);
         const len = std.mem.readInt(u16, buf[2..4], .big);
         return DltStandardHeader{
-            .buf = buf,
+            .buf = buf[0..len],
             .hdr_type = hdr_type,
             .length = len,
         };
