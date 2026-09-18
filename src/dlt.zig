@@ -412,4 +412,36 @@ pub const DltMessage = struct {
             .payload = std_hdr.payload(),
         };
     }
+    pub fn matches(self: *const DltMessage, filter: DltFilter) bool {
+        if (filter.ecuid) |feid| {
+            if (self.ecu_id) |eid| {
+                if (!std.mem.eql(u8, feid, eid)) return false;
+            } else return false;
+        }
+        if (filter.apid) |faid| {
+            if (self.app_id) |aid| {
+                if (!std.mem.eql(u8, faid, aid)) return false;
+            } else return false;
+        }
+        if (filter.ctid) |fcid| {
+            if (self.ctx_id) |cid| {
+                if (!std.mem.eql(u8, fcid, cid)) return false;
+            } else return false;
+        }
+        if (filter.severity) |flevel| {
+            if (self.level) |level| {
+                if (flevel != level) return false;
+            } else return false;
+        }
+
+        return true;
+    }
+};
+
+pub const DltFilter = struct {
+    ecuid: ?[]const u8 = null,
+    apid: ?[]const u8 = null,
+    ctid: ?[]const u8 = null,
+    severity: ?LogSeverity = null,
+    substring: ?[]const u8 = null,
 };

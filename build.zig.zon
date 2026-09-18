@@ -7,7 +7,7 @@
             .hash = "vaxis-0.6.0-BWNV_AIQDADLTDo5jCn27pBWJBvi-sTrSkSKwITQWgUV",
         },
     },
-    .minimum_zig_version = "0.17.0-dev.2131+d08989840",
+    .minimum_zig_version = "0.16.0",
     .paths = .{""},
     .fingerprint = 0xcf9a634c06d1436d,
 }
