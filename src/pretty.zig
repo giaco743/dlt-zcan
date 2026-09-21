@@ -221,6 +221,13 @@ pub fn printLog(buf: []const u8, outbuf: []u8) ![]const u8 {
 
 pub fn printMessage(msg: dlt.DltMessage, outbuf: []u8) ![]const u8 {
     var writer = std.Io.Writer.fixed(outbuf);
+    if (msg.timestamp) |ts| {
+        const h = ts / 36_000_000;
+        const m = ts / 600_000 % 60;
+        const s = ts / 10_000 % 60;
+        const fraction = ts % 10_000;
+        try writer.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>2} ", .{ h, m, s, fraction });
+    }
     if (msg.ecu_id) |ecuid| try writer.print("ECU={s} ", .{ecuid});
     if (msg.app_id) |appid| try writer.print("APP={s} ", .{appid});
     if (msg.ctx_id) |ctxid| try writer.print("CTX={s} ", .{ctxid});

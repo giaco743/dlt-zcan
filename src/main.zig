@@ -23,6 +23,51 @@ const errr: vaxis.Cell.Color = .{ .index = 1 };
 const warn: vaxis.Cell.Color = .{ .index = 3 };
 const fatal: vaxis.Cell.Color = .{ .index = 5 };
 
+fn ToggleBox(comptime title: []const u8) type {
+    return struct {
+        toggled: bool,
+
+        fn draw(
+            self: *const @This(),
+            x: u16,
+            y: u16,
+            width: u16,
+            win: vaxis.Window,
+        ) !void {
+            drawTitleBox(title, win, x, y, width);
+
+            const toggle_win = win.child(.{
+                .x_off = x + 2,
+                .y_off = y + 1,
+                .width = width - 4,
+                .height = 1,
+            });
+
+            if (self.toggled) {
+                _ = toggle_win.printSegment(
+                    .{
+                        .text = "☑",
+                    },
+                    .{
+                        .row_offset = y,
+                        .col_offset = 0,
+                    },
+                );
+            } else {
+                _ = toggle_win.printSegment(
+                    .{
+                        .text = "☐",
+                    },
+                    .{
+                        .row_offset = y,
+                        .col_offset = 0,
+                    },
+                );
+            }
+        }
+    };
+}
+
 const DltViewer = struct {
     file: []const u8,
     index: []const usize,
@@ -98,6 +143,8 @@ const Focus = enum {
     ecu,
     app,
     ctx,
+    from,
+    until,
     table,
 };
 
@@ -215,6 +262,20 @@ pub fn dltIdFromTextInput(self: *const vaxis.widgets.TextInput.Buffer, out: []u8
     return out[0..];
 }
 
+pub fn dltTimestampFromTextInput(self: *const vaxis.widgets.TextInput.Buffer, out: []u8) !?u32 {
+    const first = self.firstHalf();
+    const second = self.secondHalf();
+    if (first.len + second.len == 0) return null else if (first.len + second.len > 13) return error.OutOfBounds;
+
+    @memcpy(out[0..first.len], first);
+    @memcpy(out[first.len .. first.len + second.len], second);
+    var it = std.mem.splitScalar(u8, out, ':');
+    const h = try std.fmt.parseInt(u32, it.next() orelse return error.MissingHour, 10);
+    const m = try std.fmt.parseInt(u32, it.next() orelse return error.MissingMinutes, 10);
+    const s = try std.fmt.parseFloat(f32, it.next() orelse return error.MissingSeconds);
+    return h * 36_000_000 + m * 600_000 + @as(u32, @intFromFloat(s * 10_000));
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const alloc = init.gpa;
@@ -284,6 +345,20 @@ pub fn main(init: std.process.Init) !void {
     var ctx_input_style: vaxis.Cell.Style = .{};
     var ctx_input = vaxis.widgets.TextInput.init(alloc);
     defer ctx_input.deinit();
+    var fromout = [_]u8{0} ** 13;
+    var from_input_style: vaxis.Cell.Style = .{};
+    var from_input = vaxis.widgets.TextInput.init(alloc);
+    defer from_input.deinit();
+    var untilout = [_]u8{0} ** 13;
+    var until_input_style: vaxis.Cell.Style = .{};
+    var until_input = vaxis.widgets.TextInput.init(alloc);
+    defer until_input.deinit();
+
+    var fatal_box = ToggleBox("Fatal"){ .toggled = true };
+    var error_box = ToggleBox("Error"){ .toggled = true };
+    var warn_box = ToggleBox("Warn"){ .toggled = true };
+    var info_box = ToggleBox("Info"){ .toggled = true };
+    var debug_box = ToggleBox("Debug"){ .toggled = false };
 
     try vx.setMouseMode(tty_writer, true);
 
@@ -317,14 +392,23 @@ pub fn main(init: std.process.Init) !void {
         const style: vaxis.Style = .{
             .fg = .{ .index = 0 },
         };
-        const hdr_width = 40;
+        const hdr_width = 30;
         drawInputBox("ECU ID", win, &ecu_input, 0, 0, hdr_width, ecu_input_style);
         drawInputBox("APP ID", win, &app_input, hdr_width, 0, hdr_width, app_input_style);
         drawInputBox("CTX ID", win, &ctx_input, 2 * hdr_width, 0, hdr_width, ctx_input_style);
+        drawInputBox("From", win, &from_input, 0, 3, hdr_width, from_input_style);
+        drawInputBox("Until", win, &until_input, hdr_width, 3, hdr_width, until_input_style);
+
+        const box_size = 15;
+        try fatal_box.draw(3 * hdr_width, 0, box_size, win);
+        try error_box.draw(3 * hdr_width + box_size, 0, box_size, win);
+        try warn_box.draw(3 * hdr_width + 2 * box_size, 0, box_size, win);
+        try info_box.draw(3 * hdr_width + 3 * box_size, 0, box_size, win);
+        try debug_box.draw(3 * hdr_width + 4 * box_size, 0, box_size, win);
 
         const tbl = win.child(.{
             .x_off = 0,
-            .y_off = 3,
+            .y_off = 6,
             .width = win.width,
             .height = win.height,
             .border = .{
@@ -332,6 +416,11 @@ pub fn main(init: std.process.Init) !void {
                 .style = style,
             },
         });
+        viewer.filter.fatal = fatal_box.toggled;
+        viewer.filter.err = error_box.toggled;
+        viewer.filter.warn = warn_box.toggled;
+        viewer.filter.info = info_box.toggled;
+        viewer.filter.debug = debug_box.toggled;
         try viewer.draw(tbl);
 
         // Put the cursor where the focused input wants it.
@@ -347,6 +436,14 @@ pub fn main(init: std.process.Init) !void {
             .ctx => win.showCursor(
                 2 * hdr_width + 2 + ctx_input.prev_cursor_col,
                 1,
+            ),
+            .from => win.showCursor(
+                0 + 2 + from_input.prev_cursor_col,
+                4,
+            ),
+            .until => win.showCursor(
+                hdr_width + 2 + until_input.prev_cursor_col,
+                4,
             ),
             .table => win.hideCursor(),
         }
@@ -367,11 +464,32 @@ pub fn main(init: std.process.Init) !void {
                 if (key.matches('k', .{ .ctrl = true })) {
                     focus = .ctx;
                 }
+                if (key.matches('f', .{ .ctrl = true })) {
+                    focus = .from;
+                }
+                if (key.matches('u', .{ .ctrl = true })) {
+                    focus = .until;
+                }
                 if (key.matches('t', .{ .ctrl = true })) {
                     focus = .table;
                 }
                 if (key.matches('c', .{ .ctrl = true })) {
                     break;
+                }
+                if (key.matches('f', .{ .alt = true })) {
+                    fatal_box.toggled = !fatal_box.toggled;
+                }
+                if (key.matches('e', .{ .alt = true })) {
+                    error_box.toggled = !error_box.toggled;
+                }
+                if (key.matches('w', .{ .alt = true })) {
+                    warn_box.toggled = !warn_box.toggled;
+                }
+                if (key.matches('i', .{ .alt = true })) {
+                    info_box.toggled = !info_box.toggled;
+                }
+                if (key.matches('d', .{ .alt = true })) {
+                    debug_box.toggled = !debug_box.toggled;
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     switch (focus) {
@@ -402,6 +520,24 @@ pub fn main(init: std.process.Init) !void {
                                 ctx_input_style = .{ .fg = .{ .index = 1 } };
                             }
                         },
+                        .from => {
+                            fromout = [_]u8{0} ** 13;
+                            if (dltTimestampFromTextInput(&from_input.buf, &fromout)) |from| {
+                                from_input_style = .{ .fg = .default };
+                                viewer.filter.from = from;
+                            } else |_| {
+                                from_input_style = .{ .fg = .{ .index = 1 } };
+                            }
+                        },
+                        .until => {
+                            untilout = [_]u8{0} ** 13;
+                            if (dltTimestampFromTextInput(&until_input.buf, &untilout)) |until| {
+                                until_input_style = .{ .fg = .default };
+                                viewer.filter.until = until;
+                            } else |_| {
+                                until_input_style = .{ .fg = .{ .index = 1 } };
+                            }
+                        },
                         .table => {},
                     }
                 } else {
@@ -415,6 +551,12 @@ pub fn main(init: std.process.Init) !void {
                         },
                         .ctx => {
                             try ctx_input.update(.{ .key_press = key });
+                        },
+                        .from => {
+                            try from_input.update(.{ .key_press = key });
+                        },
+                        .until => {
+                            try until_input.update(.{ .key_press = key });
                         },
                         .table => {
                             if (key.matches(vaxis.Key.down, .{}))

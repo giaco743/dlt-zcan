@@ -100,13 +100,13 @@ pub const DltStandardHeader = struct {
         else
             return null;
     }
-    pub fn timestamp(self: *const DltStandardHeader) ?[]const u8 {
+    pub fn timestamp(self: *const DltStandardHeader) ?u32 {
         if (self.hdr_type.weid == 1 and self.hdr_type.wsid == 1 and self.hdr_type.wtms == 1)
-            return self.buf[STANDARD_HEADER_SIZE + 8 ..][0..4]
+            return std.mem.readInt(u32, self.buf[STANDARD_HEADER_SIZE + 8 ..][0..4], self.endian())
         else if (self.hdr_type.weid == 0 and self.hdr_type.wsid == 1 and self.hdr_type.wtms == 1)
-            return self.buf[STANDARD_HEADER_SIZE + 4 ..][0..4]
+            return std.mem.readInt(u32, self.buf[STANDARD_HEADER_SIZE + 4 ..][0..4], self.endian())
         else if (self.hdr_type.weid == 0 and self.hdr_type.wsid == 0 and self.hdr_type.wtms == 1)
-            return self.buf[STANDARD_HEADER_SIZE..][0..4]
+            return std.mem.readInt(u32, self.buf[STANDARD_HEADER_SIZE..][0..4], self.endian())
         else
             return null;
     }
@@ -128,6 +128,9 @@ pub const DltStandardHeader = struct {
     pub fn payload(self: *const DltStandardHeader) []const u8 {
         const payload_offset = if (self.hdr_type.wevt == 1) EXTENDED_HEADER_SIZE + self.hdrLength() else self.hdrLength();
         return self.buf[payload_offset..];
+    }
+    fn endian(self: *const DltStandardHeader) std.builtin.Endian {
+        if (self.hdr_type.msbf == 1) return .big else return .little;
     }
 };
 
@@ -390,7 +393,7 @@ pub const DltMessage = struct {
     app_id: ?[]const u8,
     ctx_id: ?[]const u8,
     level: ?LogSeverity,
-    timestamp: ?[]const u8,
+    timestamp: ?u32,
     ext_hdr: ?DltExtHeader,
     endian: std.builtin.Endian,
     payload: []const u8,
@@ -428,9 +431,26 @@ pub const DltMessage = struct {
                 if (!std.mem.eql(u8, fcid, cid)) return false;
             } else return false;
         }
-        if (filter.severity) |flevel| {
-            if (self.level) |level| {
-                if (flevel != level) return false;
+        if (filter.err or filter.fatal or filter.warn or filter.info or filter.debug) {
+            if (self.level) |level| switch (level) {
+                .fatal => if (!filter.fatal) return false,
+                .err => if (!filter.err) return false,
+                .warn => if (!filter.warn) return false,
+                .info => if (!filter.info) return false,
+                .debug => if (!filter.debug) return false,
+                else => return false,
+            } else return false;
+        } else return false;
+
+        if (filter.from) |from| {
+            if (self.timestamp) |timestamp| {
+                if (timestamp < from) return false;
+            } else return false;
+        }
+
+        if (filter.until) |until| {
+            if (self.timestamp) |timestamp| {
+                if (timestamp > until) return false;
             } else return false;
         }
 
@@ -442,6 +462,12 @@ pub const DltFilter = struct {
     ecuid: ?[]const u8 = null,
     apid: ?[]const u8 = null,
     ctid: ?[]const u8 = null,
-    severity: ?LogSeverity = null,
     substring: ?[]const u8 = null,
+    fatal: bool = true,
+    err: bool = true,
+    warn: bool = true,
+    info: bool = true,
+    debug: bool = true,
+    from: ?u32 = null,
+    until: ?u32 = null,
 };
