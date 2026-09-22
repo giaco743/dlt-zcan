@@ -68,37 +68,46 @@ fn ToggleBox(comptime title: []const u8) type {
     };
 }
 
+const CachedRow = struct {
+    idx: usize,
+    msg: dlt.DltMessage,
+};
+
 const DltViewer = struct {
     file: []const u8,
     index: []const usize,
+    rows: [MAX_VISIBLE_ROWS]CachedRow = undefined,
+    row_count: usize = 0,
     rowbufs: [MAX_VISIBLE_ROWS][ROW_BUF_SIZE]u8 = undefined,
-    first_msg_idx: u16 = 0,
     filter: dlt.DltFilter = .{},
+    at_end: bool = false,
 
     pub fn draw(self: *DltViewer, win: vaxis.Window) !void {
         const height: usize = @intCast(win.height);
         const visible = @min(height, MAX_VISIBLE_ROWS);
 
-        const end = @min(
-            visible,
-            self.index.len,
-        );
-        var visible_row_idx: u16 = 0;
-        var msg_idx = self.first_msg_idx;
-        while (visible_row_idx < end and msg_idx < self.index.len) : (msg_idx += 1) {
-            const msg_start = self.index[msg_idx] + dlt.STORAGE_HEADER_SIZE;
-            const msg =
-                try dlt.DltMessage.init(self.file[msg_start..]);
-            if (!msg.matches(self.filter)) {
-                continue;
+        // Fill the row cache if it is not full
+        if (!self.at_end) {
+            var start = if (self.row_count > 0) self.rows[self.row_count - 1].idx + 1 else 0;
+            while (self.row_count < visible) {
+                const cached_msg = try self.getNext(start) orelse {
+                    self.at_end = true;
+                    break;
+                };
+                start = cached_msg.idx + 1;
+                self.rows[self.row_count] = cached_msg;
+                self.row_count += 1;
             }
+        }
+        // Print all messages in the row buf
+        var row_idx: usize = 0;
+        while (row_idx < self.row_count) : (row_idx += 1) {
             try drawRow(
                 win,
-                @intCast(visible_row_idx),
-                msg,
-                &self.rowbufs[visible_row_idx],
+                @intCast(row_idx),
+                self.rows[row_idx].msg,
+                &self.rowbufs[row_idx],
             );
-            visible_row_idx += 1;
         }
     }
     fn drawRow(
@@ -126,16 +135,57 @@ const DltViewer = struct {
             },
         );
     }
-    fn scrollDown(self: *DltViewer) void {
-        const max_start = if (self.index[self.first_msg_idx..].len > MAX_VISIBLE_ROWS)
-            self.index[self.first_msg_idx..].len - MAX_VISIBLE_ROWS
-        else
-            0;
-
-        if (self.first_msg_idx < max_start) self.first_msg_idx += 1;
+    // Scroll down looks for the first next message, that matche the filter
+    // and copies the rest forward
+    fn scrollDown(self: *DltViewer) !void {
+        if (self.row_count == 0)
+            return;
+        const start = self.rows[self.row_count - 1].idx + 1;
+        if (start < self.index.len) {
+            std.mem.copyForwards(CachedRow, self.rows[0 .. self.row_count - 1], self.rows[1..self.row_count]);
+            if (try self.getNext(start)) |next| {
+                self.rows[self.row_count - 1] = next;
+            } else self.row_count -= 1;
+        }
     }
-    fn scrollUp(self: *DltViewer) void {
-        if (self.first_msg_idx > 0) self.first_msg_idx -= 1;
+    fn scrollUp(self: *DltViewer) !void {
+        const start = self.rows[self.row_count - 1].idx;
+        if (start > 0) {
+            if (try self.getPrev(start)) |prev| {
+                std.mem.copyBackwards(CachedRow, self.rows[1..self.row_count], self.rows[0 .. self.row_count - 1]);
+                self.rows[0] = prev;
+            }
+        }
+    }
+    fn getNext(self: *DltViewer, start: usize) !?CachedRow {
+        var idx = start;
+        while (idx < self.index.len) : (idx += 1) {
+            const msg =
+                try dlt.DltMessage.init(self.file[self.index[idx] + dlt.STORAGE_HEADER_SIZE ..]);
+
+            if (try msg.matches(self.filter)) {
+                return .{ .idx = idx, .msg = msg };
+            }
+        }
+        return null;
+    }
+    fn getPrev(self: *DltViewer, start: usize) !?CachedRow {
+        var idx = start;
+        while (idx > 0) : (idx -= 1) {
+            const msg =
+                try dlt.DltMessage.init(self.file[self.index[idx] + dlt.STORAGE_HEADER_SIZE ..]);
+
+            if (try msg.matches(self.filter)) {
+                return .{ .idx = idx, .msg = msg };
+            }
+        }
+        return null;
+    }
+    fn clear(self: *DltViewer) void {
+        self.rows = undefined;
+        self.rowbufs = undefined;
+        self.row_count = 0;
+        self.at_end = false;
     }
 };
 
@@ -145,6 +195,7 @@ const Focus = enum {
     ctx,
     from,
     until,
+    subs,
     table,
 };
 
@@ -255,11 +306,21 @@ fn drawInputBox(
 pub fn dltIdFromTextInput(self: *const vaxis.widgets.TextInput.Buffer, out: []u8) !?[]const u8 {
     const first = self.firstHalf();
     const second = self.secondHalf();
-    if (first.len + second.len == 0) return null else if (first.len + second.len > 4) return error.OutOfBounds;
+    if (first.len + second.len == 0) return null else if (first.len + second.len > out.len) return error.OutOfBounds;
 
     @memcpy(out[0..first.len], first);
     @memcpy(out[first.len .. first.len + second.len], second);
     return out[0..];
+}
+
+pub fn dltStringFromTextInput(self: *const vaxis.widgets.TextInput.Buffer, out: []u8) !?[]const u8 {
+    const first = self.firstHalf();
+    const second = self.secondHalf();
+    if (first.len + second.len == 0) return null else if (first.len + second.len > out.len) return error.OutOfBounds;
+
+    @memcpy(out[0..first.len], first);
+    @memcpy(out[first.len .. first.len + second.len], second);
+    return out[0 .. first.len + second.len];
 }
 
 pub fn dltTimestampFromTextInput(self: *const vaxis.widgets.TextInput.Buffer, out: []u8) !?u32 {
@@ -353,6 +414,10 @@ pub fn main(init: std.process.Init) !void {
     var until_input_style: vaxis.Cell.Style = .{};
     var until_input = vaxis.widgets.TextInput.init(alloc);
     defer until_input.deinit();
+    var subsout = [_]u8{0} ** 128;
+    var subs_input_style: vaxis.Cell.Style = .{};
+    var subs_input = vaxis.widgets.TextInput.init(alloc);
+    defer subs_input.deinit();
 
     var fatal_box = ToggleBox("Fatal"){ .toggled = true };
     var error_box = ToggleBox("Error"){ .toggled = true };
@@ -398,6 +463,7 @@ pub fn main(init: std.process.Init) !void {
         drawInputBox("CTX ID", win, &ctx_input, 2 * hdr_width, 0, hdr_width, ctx_input_style);
         drawInputBox("From", win, &from_input, 0, 3, hdr_width, from_input_style);
         drawInputBox("Until", win, &until_input, hdr_width, 3, hdr_width, until_input_style);
+        drawInputBox("Substring", win, &subs_input, 2 * hdr_width, 3, hdr_width * 2, subs_input_style);
 
         const box_size = 15;
         try fatal_box.draw(3 * hdr_width, 0, box_size, win);
@@ -445,6 +511,10 @@ pub fn main(init: std.process.Init) !void {
                 hdr_width + 2 + until_input.prev_cursor_col,
                 4,
             ),
+            .subs => win.showCursor(
+                2 * hdr_width + 2 + subs_input.prev_cursor_col,
+                4,
+            ),
             .table => win.hideCursor(),
         }
 
@@ -470,6 +540,9 @@ pub fn main(init: std.process.Init) !void {
                 if (key.matches('u', .{ .ctrl = true })) {
                     focus = .until;
                 }
+                if (key.matches('s', .{ .ctrl = true })) {
+                    focus = .subs;
+                }
                 if (key.matches('t', .{ .ctrl = true })) {
                     focus = .table;
                 }
@@ -478,18 +551,23 @@ pub fn main(init: std.process.Init) !void {
                 }
                 if (key.matches('f', .{ .alt = true })) {
                     fatal_box.toggled = !fatal_box.toggled;
+                    viewer.clear();
                 }
                 if (key.matches('e', .{ .alt = true })) {
                     error_box.toggled = !error_box.toggled;
+                    viewer.clear();
                 }
                 if (key.matches('w', .{ .alt = true })) {
                     warn_box.toggled = !warn_box.toggled;
+                    viewer.clear();
                 }
                 if (key.matches('i', .{ .alt = true })) {
                     info_box.toggled = !info_box.toggled;
+                    viewer.clear();
                 }
                 if (key.matches('d', .{ .alt = true })) {
                     debug_box.toggled = !debug_box.toggled;
+                    viewer.clear();
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     switch (focus) {
@@ -498,6 +576,7 @@ pub fn main(init: std.process.Init) !void {
                             if (dltIdFromTextInput(&ecu_input.buf, &ecuout)) |id| {
                                 ecu_input_style = .{ .fg = .default };
                                 viewer.filter.ecuid = id;
+                                viewer.clear();
                             } else |_| {
                                 ecu_input_style = .{ .fg = .{ .index = 1 } };
                             }
@@ -507,6 +586,7 @@ pub fn main(init: std.process.Init) !void {
                             if (dltIdFromTextInput(&app_input.buf, &appout)) |id| {
                                 app_input_style = .{ .fg = .default };
                                 viewer.filter.apid = id;
+                                viewer.clear();
                             } else |_| {
                                 app_input_style = .{ .fg = .{ .index = 1 } };
                             }
@@ -516,6 +596,7 @@ pub fn main(init: std.process.Init) !void {
                             if (dltIdFromTextInput(&ctx_input.buf, &ctxout)) |id| {
                                 ctx_input_style = .{ .fg = .default };
                                 viewer.filter.ctid = id;
+                                viewer.clear();
                             } else |_| {
                                 ctx_input_style = .{ .fg = .{ .index = 1 } };
                             }
@@ -525,6 +606,7 @@ pub fn main(init: std.process.Init) !void {
                             if (dltTimestampFromTextInput(&from_input.buf, &fromout)) |from| {
                                 from_input_style = .{ .fg = .default };
                                 viewer.filter.from = from;
+                                viewer.clear();
                             } else |_| {
                                 from_input_style = .{ .fg = .{ .index = 1 } };
                             }
@@ -534,8 +616,19 @@ pub fn main(init: std.process.Init) !void {
                             if (dltTimestampFromTextInput(&until_input.buf, &untilout)) |until| {
                                 until_input_style = .{ .fg = .default };
                                 viewer.filter.until = until;
+                                viewer.clear();
                             } else |_| {
                                 until_input_style = .{ .fg = .{ .index = 1 } };
+                            }
+                        },
+                        .subs => {
+                            subsout = [_]u8{0} ** 128;
+                            if (dltStringFromTextInput(&subs_input.buf, &subsout)) |subs| {
+                                subs_input_style = .{ .fg = .default };
+                                viewer.filter.substring = subs;
+                                viewer.clear();
+                            } else |_| {
+                                subs_input_style = .{ .fg = .{ .index = 1 } };
                             }
                         },
                         .table => {},
@@ -558,12 +651,16 @@ pub fn main(init: std.process.Init) !void {
                         .until => {
                             try until_input.update(.{ .key_press = key });
                         },
+
+                        .subs => {
+                            try subs_input.update(.{ .key_press = key });
+                        },
                         .table => {
                             if (key.matches(vaxis.Key.down, .{}))
-                                viewer.scrollDown();
+                                try viewer.scrollDown();
 
                             if (key.matches(vaxis.Key.up, .{}))
-                                viewer.scrollUp();
+                                try viewer.scrollUp();
                         },
                     }
                 }

@@ -112,8 +112,16 @@ pub const DltStandardHeader = struct {
     }
     pub fn extHdr(self: *const DltStandardHeader) !?DltExtHeader {
         if (self.hdr_type.wevt == 1) {
-            return try DltExtHeader.init(self.buf[self.hdrLength()..], if (self.hdr_type.msbf == 1) .big else .little);
-        } else return null;
+            const hdr_len = self.hdrLength();
+            const ext_len = self.length - hdr_len;
+
+            return try DltExtHeader.init(
+                self.buf[hdr_len..][0..ext_len],
+                if (self.hdr_type.msbf == 1) .big else .little,
+            );
+        }
+
+        return null;
     }
     pub fn hdrLength(self: *const DltStandardHeader) usize {
         if (@as(u8, @intCast(self.hdr_type.weid)) + @as(u8, @intCast(self.hdr_type.wsid)) + @as(u8, @intCast(self.hdr_type.wtms)) == 3)
@@ -260,8 +268,11 @@ const ArgIterator = struct {
 
     pub fn next(self: *ArgIterator) !?Arg {
         var buf = self.buffer[self.offset..];
-        if (self.i_arg >= self.noar)
-            if (buf.len == 0) return null else return error.Truncated;
+        if (self.i_arg >= self.noar) {
+            if (buf.len == 0) return null else {
+                return error.Truncated;
+            }
+        }
 
         if (buf.len == 0) return error.EndOfArgs;
         if (buf.len < 4) return error.TruncatedArg;
@@ -272,6 +283,7 @@ const ArgIterator = struct {
             self.endian,
         );
         const type_info: TypeInfo = @bitCast(raw_type_info);
+
         self.offset += 4;
         buf = self.buffer[self.offset..];
         if (type_info.strg == 1) {
@@ -307,7 +319,7 @@ const ArgIterator = struct {
 
             self.offset += length;
             self.i_arg += 1;
-            return .{ .raw = self.buffer[0..length] };
+            return .{ .raw = buf[2..][0..length] };
         } else if (type_info.sint == 1 or type_info.uint == 1) {
             const size = try typeLength(type_info.tyle);
             if (type_info.aray == 1) {
@@ -415,7 +427,7 @@ pub const DltMessage = struct {
             .payload = std_hdr.payload(),
         };
     }
-    pub fn matches(self: *const DltMessage, filter: DltFilter) bool {
+    pub fn matches(self: *const DltMessage, filter: DltFilter) !bool {
         if (filter.ecuid) |feid| {
             if (self.ecu_id) |eid| {
                 if (!std.mem.eql(u8, feid, eid)) return false;
@@ -451,6 +463,26 @@ pub const DltMessage = struct {
         if (filter.until) |until| {
             if (self.timestamp) |timestamp| {
                 if (timestamp > until) return false;
+            } else return false;
+        }
+
+        if (filter.substring) |substring| {
+            if (self.ext_hdr) |ehdr| {
+                if (ehdr.messageInfo().verbose == 0 or ehdr.noar() == 0) return false;
+                var found = false;
+                var it = ehdr.argIterator();
+                while ((try it.next())) |arg| {
+                    switch (arg) {
+                        .string => |s| {
+                            if (std.mem.containsAtLeast(u8, s, 1, substring)) {
+                                found = true;
+                                break;
+                            }
+                        },
+                        else => continue,
+                    }
+                }
+                if (!found) return false;
             } else return false;
         }
 
