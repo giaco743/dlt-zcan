@@ -18,6 +18,9 @@ const pretty = @import("pretty.zig");
 const MAX_VISIBLE_ROWS = 64;
 const ROW_BUF_SIZE = 4 * 1024;
 
+const MIN_TEXT_FIELD_WIDTH = 30;
+const TOGGLE_BOX_WIDTH = 15;
+
 const normal: vaxis.Cell.Color = .default;
 const errr: vaxis.Cell.Color = .{ .index = 1 };
 const warn: vaxis.Cell.Color = .{ .index = 3 };
@@ -389,6 +392,7 @@ pub fn main(init: std.process.Init) !void {
         key_press: vaxis.Key,
         winsize: vaxis.Winsize,
     }) = .init(io, &tty, &vx);
+    try loop.installResizeHandler();
     try loop.start();
     defer loop.stop();
     try vx.enterAltScreen(tty_writer);
@@ -457,26 +461,70 @@ pub fn main(init: std.process.Init) !void {
         const style: vaxis.Style = .{
             .fg = .{ .index = 0 },
         };
-        const hdr_width = 30;
-        drawInputBox("ECU ID", win, &ecu_input, 0, 0, hdr_width, ecu_input_style);
-        drawInputBox("APP ID", win, &app_input, hdr_width, 0, hdr_width, app_input_style);
-        drawInputBox("CTX ID", win, &ctx_input, 2 * hdr_width, 0, hdr_width, ctx_input_style);
-        drawInputBox("From", win, &from_input, 0, 3, hdr_width, from_input_style);
-        drawInputBox("Until", win, &until_input, hdr_width, 3, hdr_width, until_input_style);
-        drawInputBox("Substring", win, &subs_input, 2 * hdr_width, 3, hdr_width * 2, subs_input_style);
+        const hdr_width: ?u16 = if (win.height < 6)
+            null
+        else if (win.width >= 3 * MIN_TEXT_FIELD_WIDTH + 5 * TOGGLE_BOX_WIDTH)
+            (win.width - 5 * TOGGLE_BOX_WIDTH) / 3
+        else if (win.width >= 3 * MIN_TEXT_FIELD_WIDTH)
+            win.width / 3
+        else
+            null;
+        if (hdr_width) |width| {
+            // Text fields
+            drawInputBox("ECU ID", win, &ecu_input, 0, 0, width, ecu_input_style);
+            drawInputBox("APP ID", win, &app_input, width, 0, width, app_input_style);
+            drawInputBox("CTX ID", win, &ctx_input, 2 * width, 0, width, ctx_input_style);
+            drawInputBox("From", win, &from_input, 0, 3, width, from_input_style);
+            drawInputBox("Until", win, &until_input, width, 3, width, until_input_style);
+            drawInputBox("Substring", win, &subs_input, 2 * width, 3, width, subs_input_style);
 
-        const box_size = 15;
-        try fatal_box.draw(3 * hdr_width, 0, box_size, win);
-        try error_box.draw(3 * hdr_width + box_size, 0, box_size, win);
-        try warn_box.draw(3 * hdr_width + 2 * box_size, 0, box_size, win);
-        try info_box.draw(3 * hdr_width + 3 * box_size, 0, box_size, win);
-        try debug_box.draw(3 * hdr_width + 4 * box_size, 0, box_size, win);
+            // Put the cursor where the focused input wants it.
+            switch (focus) {
+                .ecu => win.showCursor(
+                    0 + 2 + ecu_input.prev_cursor_col,
+                    1,
+                ),
+                .app => win.showCursor(
+                    width + 2 + app_input.prev_cursor_col,
+                    1,
+                ),
+                .ctx => win.showCursor(
+                    2 * width + 2 + ctx_input.prev_cursor_col,
+                    1,
+                ),
+                .from => win.showCursor(
+                    0 + 2 + from_input.prev_cursor_col,
+                    4,
+                ),
+                .until => win.showCursor(
+                    width + 2 + until_input.prev_cursor_col,
+                    4,
+                ),
+                .subs => win.showCursor(
+                    2 * width + 2 + subs_input.prev_cursor_col,
+                    4,
+                ),
+                .table => win.hideCursor(),
+            }
 
+            // Toggle boxes
+            if (win.width >= 3 * MIN_TEXT_FIELD_WIDTH + 5 * TOGGLE_BOX_WIDTH) {
+                try fatal_box.draw(3 * width, 0, TOGGLE_BOX_WIDTH, win);
+                try error_box.draw(3 * width + TOGGLE_BOX_WIDTH, 0, TOGGLE_BOX_WIDTH, win);
+                try warn_box.draw(3 * width + 2 * TOGGLE_BOX_WIDTH, 0, TOGGLE_BOX_WIDTH, win);
+                try info_box.draw(3 * width + 3 * TOGGLE_BOX_WIDTH, 0, TOGGLE_BOX_WIDTH, win);
+                try debug_box.draw(3 * width + 4 * TOGGLE_BOX_WIDTH, 0, TOGGLE_BOX_WIDTH, win);
+
+                drawInputBox("Substring", win, &subs_input, 2 * width, 3, width + 5 * TOGGLE_BOX_WIDTH, subs_input_style);
+            } else drawInputBox("Substring", win, &subs_input, 2 * width, 3, width, subs_input_style);
+        }
+
+        const y_offset_table: u16 = if (hdr_width == null) 0 else 6;
         const tbl = win.child(.{
             .x_off = 0,
-            .y_off = 6,
+            .y_off = y_offset_table,
             .width = win.width,
-            .height = win.height,
+            .height = win.height - y_offset_table,
             .border = .{
                 .where = .all,
                 .style = style,
@@ -488,35 +536,6 @@ pub fn main(init: std.process.Init) !void {
         viewer.filter.info = info_box.toggled;
         viewer.filter.debug = debug_box.toggled;
         try viewer.draw(tbl);
-
-        // Put the cursor where the focused input wants it.
-        switch (focus) {
-            .ecu => win.showCursor(
-                0 + 2 + ecu_input.prev_cursor_col,
-                1,
-            ),
-            .app => win.showCursor(
-                hdr_width + 2 + app_input.prev_cursor_col,
-                1,
-            ),
-            .ctx => win.showCursor(
-                2 * hdr_width + 2 + ctx_input.prev_cursor_col,
-                1,
-            ),
-            .from => win.showCursor(
-                0 + 2 + from_input.prev_cursor_col,
-                4,
-            ),
-            .until => win.showCursor(
-                hdr_width + 2 + until_input.prev_cursor_col,
-                4,
-            ),
-            .subs => win.showCursor(
-                2 * hdr_width + 2 + subs_input.prev_cursor_col,
-                4,
-            ),
-            .table => win.hideCursor(),
-        }
 
         try vx.render(tty_writer);
         try tty_writer.flush();
