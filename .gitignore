@@ -1,6 +1,5 @@
 filtered.dlt
 dlt-zcan
-testfiles/*
 .zig-cache/
 main
 zig-pkg/
